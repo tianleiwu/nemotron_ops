@@ -30,7 +30,61 @@ BOLT_PLUGIN=<libonnxruntime_providers_cuda.so of the CUDA plugin EP> BOLT_OPS=bu
 | `MoeVerify` | `MoeDecode` for R <= 8 rows (speculative verification): (token, expert) pairs are grouped by expert, each unique expert's int4 weights are read once and applied to all rows with tensor-core MMAs | as `MoeDecode` + an int32 scratch output (expert groups) |
 | `Relu2` | `Relu` + `Mul` | x -> bf16(relu(x)^2) |
 
-All numerics follow the bf16/fp32 rounding points of the ONNX chains they replace (see the header of `src/bolt_ops.cu`).
+Match the bf16/fp32 tensor boundaries of the intended source graph/backend;
+in particular, the Mamba boundaries below must be chosen explicitly.
+
+## Explicit Mamba BF16 boundary controls
+
+The default kernels preserve the existing FP32 convolution-through-SiLU and
+FP32-readout-to-normalization behavior. For source-backend comparisons, two
+independent build options restore intervening BF16 tensor boundaries:
+
+```bash
+cmake -S . -B build-bf16-boundaries \
+  -DORT_INCLUDE_DIR=<ort>/include/onnxruntime/core/session \
+  -DCMAKE_CUDA_COMPILER=$CUDA_HOME/bin/nvcc \
+  -DBOLT_MAMBA_ROUND_CONV_BEFORE_SILU=ON \
+  -DBOLT_MAMBA_ROUND_READOUT_BEFORE_NORM=ON
+cmake --build build-bf16-boundaries -j
+```
+
+Both options default to `OFF`; enable either independently to isolate its
+effect. They apply to `MambaStep` and `MambaVerify`, including the specialized
+eight-row path:
+
+- `BOLT_MAMBA_ROUND_CONV_BEFORE_SILU`: cast the completed FP32 convolution to
+  BF16 and widen back to FP32 before SiLU. Raw convolution state is unchanged.
+- `BOLT_MAMBA_ROUND_READOUT_BEFORE_NORM`: cast the readout to BF16 and widen
+  back to FP32 before gating and variance accumulation. Recurrent state and
+  the diagnostic FP32 readout output remain unchanged. Gate, normalization
+  and gamma arithmetic retain their existing FP32 policy.
+
+These are **explicit numerical variants**, not a claim of full-model parity.
+Separate PyTorch BF16 convolution and SiLU impose the first boundary, whereas
+a fused causal-convolution backend may not. BF16 scan/update output imposes
+the second boundary even when recurrent state is FP32. Pin the intended
+reference backend before choosing a variant. Do not overwrite a qualified
+package's library or compare different packed weights when attributing drift.
+Use ORT headers matching the runtime that will load the library: a custom
+library requesting a newer ORT API cannot be loaded by an older runtime.
+
+Focused CUDA tests build all four combinations and exercise both generic and
+specialized convolution, state history, and group-size 1,024 and 512 norm
+paths. They use small discriminating operands and no model weights, Python
+ORT, downloads, or explicit protobuf APIs:
+
+```bash
+cmake -S . -B build-rounding-tests \
+  -DORT_INCLUDE_DIR=<ort>/include/onnxruntime/core/session \
+  -DCMAKE_CUDA_COMPILER=$CUDA_HOME/bin/nvcc \
+  -DBOLT_BUILD_MAMBA_ROUNDING_TESTS=ON
+cmake --build build-rounding-tests -j
+CUDA_VISIBLE_DEVICES=0 ctest --test-dir build-rounding-tests \
+  --output-on-failure -R mamba_rounding
+```
+
+Passing these stage regressions does not establish full decoder, ordinary
+generation, or speculative-integration correctness.
 
 ## Multi-row (speculative verify) path
 

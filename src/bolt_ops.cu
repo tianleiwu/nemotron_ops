@@ -26,6 +26,13 @@
 
 #include "iq2xxs_grid.h"
 
+#ifndef BOLT_MAMBA_ROUND_CONV_BEFORE_SILU
+#define BOLT_MAMBA_ROUND_CONV_BEFORE_SILU 0
+#endif
+#ifndef BOLT_MAMBA_ROUND_READOUT_BEFORE_NORM
+#define BOLT_MAMBA_ROUND_READOUT_BEFORE_NORM 0
+#endif
+
 namespace {
 
 using bf16 = __nv_bfloat16;
@@ -33,6 +40,15 @@ constexpr int kMaxRows = 16;
 
 __device__ __forceinline__ float B2F(bf16 v) { return __bfloat162float(v); }
 __device__ __forceinline__ float Silu(float v) { return v / (1.0f + expf(-v)); }
+
+__device__ __forceinline__ float MambaNormReadout(float v) {
+#if BOLT_MAMBA_ROUND_READOUT_BEFORE_NORM
+  // Preserve the BF16 scan-output boundary before FP32 gate/variance math.
+  return B2F(__float2bfloat16(v));
+#else
+  return v;
+#endif
+}
 
 void CheckLaunch() {
   cudaError_t error = cudaGetLastError();
@@ -89,6 +105,9 @@ __global__ void MambaConvKernel(const bf16* __restrict__ proj, int R_rt, int pro
 #pragma unroll
     for (int r = 0; r < R_FIXED; ++r) {
       float acc = bias + w0 * inp[r] + w1 * inp[r + 1] + w2 * inp[r + 2] + w3 * inp[r + 3];
+#if BOLT_MAMBA_ROUND_CONV_BEFORE_SILU
+      acc = B2F(__float2bfloat16(acc));
+#endif
       xbc_act[static_cast<int64_t>(r) * conv_dim + c] = __float2bfloat16(Silu(acc));
     }
     if constexpr (ALL_ROWS) {
@@ -108,6 +127,9 @@ __global__ void MambaConvKernel(const bf16* __restrict__ proj, int R_rt, int pro
     for (int r = 0; r < R; ++r) inp[3 + r] = B2F(proj[static_cast<int64_t>(r) * proj_stride + di + c]);
     for (int r = 0; r < R; ++r) {
       float acc = bias + w0 * inp[r] + w1 * inp[r + 1] + w2 * inp[r + 2] + w3 * inp[r + 3];
+#if BOLT_MAMBA_ROUND_CONV_BEFORE_SILU
+      acc = B2F(__float2bfloat16(acc));
+#endif
       xbc_act[static_cast<int64_t>(r) * conv_dim + c] = __float2bfloat16(Silu(acc));
     }
     if (all_rows) {
@@ -247,7 +269,7 @@ __global__ void MambaNormKernel(const bf16* __restrict__ proj, int proj_stride, 
     for (int k = 0; k < 4; ++k) {
       const int i = tid + k * 256;
       const float gt = B2F(__ldg(gate + i));
-      v[k] = __ldg(ypre + base + i) * (gt / (1.0f + expf(-gt)));
+      v[k] = MambaNormReadout(__ldg(ypre + base + i)) * (gt / (1.0f + expf(-gt)));
       ss += v[k] * v[k];
     }
     for (int o = 16; o > 0; o >>= 1) ss += __shfl_down_sync(0xffffffff, ss, o);
@@ -270,7 +292,7 @@ __global__ void MambaNormKernel(const bf16* __restrict__ proj, int proj_stride, 
   float ss = 0.f;
   for (int i = threadIdx.x; i < group_size; i += blockDim.x) {
     const float gt = B2F(gate[i]);
-    const float v = ypre[base + i] * (gt / (1.0f + expf(-gt)));
+    const float v = MambaNormReadout(ypre[base + i]) * (gt / (1.0f + expf(-gt)));
     ss += v * v;
   }
   for (int o = 16; o > 0; o >>= 1) ss += __shfl_down_sync(0xffffffff, ss, o);
@@ -285,7 +307,7 @@ __global__ void MambaNormKernel(const bf16* __restrict__ proj, int proj_stride, 
   const float rs = rsqrtf(red[0] / group_size + eps);
   for (int i = threadIdx.x; i < group_size; i += blockDim.x) {
     const float gt = B2F(gate[i]);
-    const float v = ypre[base + i] * (gt / (1.0f + expf(-gt)));
+    const float v = MambaNormReadout(ypre[base + i]) * (gt / (1.0f + expf(-gt)));
     y[base + i] = __float2bfloat16(v * rs * norm_w[g * group_size + i]);
   }
 }
