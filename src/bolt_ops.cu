@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <type_traits>
 #include <mutex>
@@ -64,7 +65,7 @@ int64_t Count(const Ort::ConstValue& v) {
 // MambaStep
 // ------------------------------------------------------------------------------------------------------------------
 // proj row layout: [gate (di) | xBC (conv_dim = di + 2*ng*ds) | dt (heads)]
-template <int R_FIXED = 0, bool ALL_ROWS = false>
+template <int R_FIXED = 0, bool ALL_ROWS = false, int FINAL_ROW = 0>
 __global__ void MambaConvKernel(const bf16* __restrict__ proj, int R_rt, int proj_stride, int di, int conv_dim,
                                 const bf16* __restrict__ conv_state_in, const bf16* __restrict__ conv_w,
                                 const bf16* __restrict__ conv_b, bf16* __restrict__ conv_state_out,
@@ -100,9 +101,10 @@ __global__ void MambaConvKernel(const bf16* __restrict__ proj, int R_rt, int pro
         o[2] = __float2bfloat16(inp[r + 3]);
       }
     } else {
-      conv_state_out[c * 3 + 0] = __float2bfloat16(inp[R_FIXED]);
-      conv_state_out[c * 3 + 1] = __float2bfloat16(inp[R_FIXED + 1]);
-      conv_state_out[c * 3 + 2] = __float2bfloat16(inp[R_FIXED + 2]);
+      bf16* o = conv_state_out + (static_cast<int64_t>(FINAL_ROW) * conv_dim + c) * 3;
+      o[0] = __float2bfloat16(inp[R_FIXED]);
+      o[1] = __float2bfloat16(inp[R_FIXED + 1]);
+      o[2] = __float2bfloat16(inp[R_FIXED + 2]);
     }
   } else {
     for (int r = 0; r < R; ++r) inp[3 + r] = B2F(proj[static_cast<int64_t>(r) * proj_stride + di + c]);
@@ -127,7 +129,7 @@ __global__ void MambaConvKernel(const bf16* __restrict__ proj, int R_rt, int pro
 
 // Block (h, pb) owns head h and p-tile pb of width PT (HD = PT * gridDim.y). State layout [heads, ds, hd] (hd contiguous), fp32.
 // Thread (p_local, part) owns state[n in part][p_base + p_local]; the QP parts split d_state.
-template <int DS, int HD, int QP, int PT = HD, int R_FIXED = 0, bool ALL_ROWS = false>
+template <int DS, int HD, int QP, int PT = HD, int R_FIXED = 0, bool ALL_ROWS = false, int FINAL_ROW = 0>
 __global__ void MambaSsmKernel(const bf16* __restrict__ proj, int R_rt, int proj_stride, int di, int conv_dim, int heads,
                                int heads_per_group, const bf16* __restrict__ xbc_act,
                                const float* __restrict__ ssm_in, const float* __restrict__ dt_bias,
@@ -191,7 +193,7 @@ __global__ void MambaSsmKernel(const bf16* __restrict__ proj, int R_rt, int proj
       }
     }
     if constexpr (!ALL_ROWS) {
-      float* op = ssm_out + (static_cast<int64_t>(h) * DS + half * NH) * HD + p;
+      float* op = ssm_out + static_cast<int64_t>(FINAL_ROW) * row_stride + (static_cast<int64_t>(h) * DS + half * NH) * HD + p;
 #pragma unroll
       for (int n = 0; n < NH; ++n) op[static_cast<int64_t>(n) * HD] = st[n];
     }
@@ -317,7 +319,19 @@ struct MambaStepState {
       if (Dim(proj, 1) != stride) throw std::invalid_argument("MambaStep: bad proj width");
       auto y = c.GetOutput(0, std::vector<int64_t>{R, di});
       const int* sel = verify ? In<int>(c, 9) : nullptr;
-      if (verify && Dim(c.GetInput(1), 0) < R) throw std::invalid_argument("MambaVerify: state buffer needs >= R rows");
+      if (verify) {
+        const int64_t conv_rows = Dim(c.GetInput(1), 0);
+        const int64_t ssm_rows = Dim(c.GetInput(2), 0);
+        if (R >= 1 && R <= 8) {
+          if (conv_rows < R || ssm_rows < R)
+            throw std::invalid_argument("MambaVerify: state buffer needs >= R rows");
+        } else if (R == 16) {
+          if (conv_rows < 8 || ssm_rows < 8)
+            throw std::invalid_argument("MambaVerify R=16: state buffer needs >= 8 rows");
+        } else {
+          throw std::invalid_argument("MambaVerify: rows must be in [1,8] or 16");
+        }
+      }
       auto conv_out = c.GetOutput(1, c.GetInput(1).GetTensorTypeAndShapeInfo().GetShape());
       auto ssm_out = c.GetOutput(2, c.GetInput(2).GetTensorTypeAndShapeInfo().GetShape());
       auto xbc_act = c.GetOutput(3, std::vector<int64_t>{R, conv_dim});
@@ -332,6 +346,15 @@ struct MambaStepState {
                                                                       In<float>(c, 5), In<float>(c, 6), In<float>(c, 7),
                                                                       tmin, Out<float>(ssm_out), Out<float>(ypre), sel,
                                                                       verify);
+      } else if (R == 16 && verify) {
+        MambaConvKernel<16, false, 7><<<(conv_dim + 63) / 64, 64, 0, s>>>(In<bf16>(c, 0), R, stride, di, conv_dim, In<bf16>(c, 1),
+                                                                          In<bf16>(c, 3), In<bf16>(c, 4), Out<bf16>(conv_out),
+                                                                          Out<bf16>(xbc_act), sel, false);
+        MambaSsmKernel<128, 64, 4, 64, 16, false, 7><<<heads, 256, 0, s>>>(In<bf16>(c, 0), R, stride, di, conv_dim, heads,
+                                                                           heads / ng, Out<bf16>(xbc_act), In<float>(c, 2),
+                                                                           In<float>(c, 5), In<float>(c, 6), In<float>(c, 7),
+                                                                           tmin, Out<float>(ssm_out), Out<float>(ypre), sel,
+                                                                           false);
       } else {
         MambaConvKernel<<<(conv_dim + 127) / 128, 128, 0, s>>>(In<bf16>(c, 0), R, stride, di, conv_dim, In<bf16>(c, 1),
                                                                In<bf16>(c, 3), In<bf16>(c, 4), Out<bf16>(conv_out),
@@ -1076,6 +1099,178 @@ void LaunchMmaGemv(const bf16* x, const uint8_t* w, const void* sc, const float*
 }
 
 // ------------------------------------------------------------------------------------------------------------------
+// R=16 (9 <= R <= 16) two-tile (NT=2, 2 x mma.m16n8k16) dense GEMV sharing each weight load & dequantization across
+// both 8-row activation halves.
+// ------------------------------------------------------------------------------------------------------------------
+template <int FMT, bool WIDE, int MT>
+struct StageT_R16 {
+  static constexpr int NH = WIDE ? 2 : 1;
+  static constexpr int NSC = (FMT == kFmtFp4 && WIDE) ? 2 : 1;
+  uint4 raw[MT][2];
+  float sc[MT][2][NSC];
+  uint4 x[2][2 * NH];
+};
+
+template <int FMT, bool WIDE, int MT>
+__device__ __forceinline__ void ComputeStage_R16(const StageT_R16<FMT, WIDE, MT>& st, float (*acc)[2][4]) {
+#pragma unroll
+  for (int h = 0; h < StageT_R16<FMT, WIDE, MT>::NH; ++h) {
+    uint32_t bl[2][4], bh[2][4];
+#pragma unroll
+    for (int nt = 0; nt < 2; ++nt) {
+      const uint4 xa = st.x[nt][2 * h], xb = st.x[nt][2 * h + 1];
+      if constexpr (FMT == kFmtIq2 || FMT == kFmtIq2N) {
+        bl[nt][0] = xa.x; bh[nt][0] = xa.y; bl[nt][1] = xa.z; bh[nt][1] = xa.w;
+        bl[nt][2] = xb.x; bh[nt][2] = xb.y; bl[nt][3] = xb.z; bh[nt][3] = xb.w;
+      } else {
+        bl[nt][0] = __byte_perm(xa.x, xa.z, 0x5410);
+        bl[nt][1] = __byte_perm(xa.x, xa.z, 0x7632);
+        bl[nt][2] = __byte_perm(xa.y, xa.w, 0x5410);
+        bl[nt][3] = __byte_perm(xa.y, xa.w, 0x7632);
+        bh[nt][0] = __byte_perm(xb.x, xb.z, 0x5410);
+        bh[nt][1] = __byte_perm(xb.x, xb.z, 0x7632);
+        bh[nt][2] = __byte_perm(xb.y, xb.w, 0x5410);
+        bh[nt][3] = __byte_perm(xb.y, xb.w, 0x7632);
+      }
+    }
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+      uint32_t lo0[4], hi0[4], lo1[4], hi1[4];
+      uint4 r0 = st.raw[m][0], r1 = st.raw[m][1];
+      if constexpr (WIDE) {
+        if (h == 1) {
+          r0 = make_uint4(r0.z, r0.w, 0u, 0u);
+          r1 = make_uint4(r1.z, r1.w, 0u, 0u);
+        }
+      }
+      constexpr int sh = (FMT == kFmtFp4 && WIDE) ? 1 : 0;
+      DequantRow<FMT>(r0, st.sc[m][0][h * sh], lo0, hi0);
+      DequantRow<FMT>(r1, st.sc[m][1][h * sh], lo1, hi1);
+#pragma unroll
+      for (int nt = 0; nt < 2; ++nt) {
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+          Mma16816(acc[m][nt], lo0[s], lo1[s], hi0[s], hi1[s], bl[nt][s], bh[nt][s]);
+        }
+      }
+    }
+  }
+}
+
+template <int MT, int KW, typename F>
+__device__ __forceinline__ void ReduceEpilogue_R16(float (*acc)[2][4], int warp, int g, int t, F&& f) {
+  extern __shared__ float red[];
+#pragma unroll
+  for (int m = 0; m < MT; ++m) {
+#pragma unroll
+    for (int nt = 0; nt < 2; ++nt) {
+      float* r0 = red + (warp * MT * 16 + m * 16 + g) * 16 + nt * 8 + 2 * t;
+      r0[0] = acc[m][nt][0];
+      r0[1] = acc[m][nt][1];
+      r0[8 * 16] = acc[m][nt][2];
+      r0[8 * 16 + 1] = acc[m][nt][3];
+    }
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < MT * 16 * 16; i += KW * 32) {
+    const int rl = i >> 4, col = i & 15;
+    float v = 0.f;
+#pragma unroll
+    for (int k = 0; k < KW; ++k) v += red[(k * MT * 16 + rl) * 16 + col];
+    f(rl, col, v);
+  }
+}
+
+template <int FMT, bool WIDE, int MT, int KW, int UNR, typename L>
+__device__ __forceinline__ void MmaMainLoop_R16(int warp, int nchunks, float (*acc)[2][4], L&& load) {
+  using Stage = StageT_R16<FMT, WIDE, MT>;
+  Stage cur[UNR], nxt[UNR];
+  int c0 = warp;
+#pragma unroll
+  for (int j = 0; j < UNR; ++j)
+    if (c0 + j * KW < nchunks) load(c0 + j * KW, cur[j]);
+  for (; c0 < nchunks; c0 += KW * UNR) {
+#pragma unroll
+    for (int j = 0; j < UNR; ++j)
+      if (c0 + (UNR + j) * KW < nchunks) load(c0 + (UNR + j) * KW, nxt[j]);
+#pragma unroll
+    for (int j = 0; j < UNR; ++j)
+      if (c0 + j * KW < nchunks) ComputeStage_R16<FMT, WIDE, MT>(cur[j], acc);
+#pragma unroll
+    for (int j = 0; j < UNR; ++j) cur[j] = nxt[j];
+  }
+}
+
+template <int FMT, bool WIDE, int MT, int KW, int UNR>
+__global__ void __launch_bounds__(KW * 32)
+    MmaGemvKernel_R16(const bf16* __restrict__ x, const uint8_t* __restrict__ w, const void* __restrict__ sc,
+                      const float* __restrict__ gscale, int R, int N, int K, bf16* __restrict__ y) {
+  constexpr int NH = WIDE ? 2 : 1;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int g = lane >> 2, t = lane & 3;
+  const int nchunks = K / (64 * NH);
+  const int64_t n_base = static_cast<int64_t>(blockIdx.x) * (MT * 16);
+  const bf16* xr0 = x + static_cast<int64_t>(min(g, R - 1)) * K;
+  const bf16* xr1 = x + static_cast<int64_t>(min(8 + g, R - 1)) * K;
+  const bool xvalid0 = g < R;
+  const bool xvalid1 = (8 + g) < R;
+  float acc[MT][2][4];
+#pragma unroll
+  for (int m = 0; m < MT; ++m)
+#pragma unroll
+    for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+      for (int i = 0; i < 4; ++i) acc[m][nt][i] = 0.f;
+  MmaMainLoop_R16<FMT, WIDE, MT, KW, UNR>(warp, nchunks, acc, [&](int c, StageT_R16<FMT, WIDE, MT>& st) {
+#pragma unroll
+    for (int m = 0; m < MT; ++m)
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int64_t row = min(n_base + m * 16 + g + 8 * h, static_cast<int64_t>(N - 1));
+        LoadWeightRow<FMT, WIDE>(w, sc, row, K, c, t, st.raw[m][h], st.sc[m][h]);
+      }
+    LoadX<NH>(xr0, xvalid0, c, t, st.x[0]);
+    LoadX<NH>(xr1, xvalid1, c, t, st.x[1]);
+  });
+  const float gs = (gscale ? gscale[0] : 1.0f) * (FMT == kFmtFp4 ? 0x1p16f : 1.0f);
+  ReduceEpilogue_R16<MT, KW>(acc, warp, g, t, [&](int rl, int col, float v) {
+    if (col < R && n_base + rl < N) y[static_cast<int64_t>(col) * N + n_base + rl] = __float2bfloat16(v * gs);
+  });
+}
+
+template <int FMT, bool WIDE, int MT, int KW, int UNR = 1>
+void LaunchMmaGemvImpl_R16(const bf16* x, const uint8_t* w, const void* sc, const float* gs, int R, int N, int K, bf16* y,
+                           cudaStream_t s) {
+  const int blocks = (N + MT * 16 - 1) / (MT * 16);
+  MmaGemvKernel_R16<FMT, WIDE, MT, KW, UNR><<<blocks, KW * 32, KW * MT * 16 * 16 * sizeof(float), s>>>(x, w, sc, gs, R, N, K, y);
+}
+
+template <int FMT>
+void LaunchMmaGemv_R16(const bf16* x, const uint8_t* w, const void* sc, const float* gs, int R, int N, int K, bf16* y,
+                       cudaStream_t s) {
+  static const int forced = getenv("BOLT_GEMV_CFG") ? atoi(getenv("BOLT_GEMV_CFG")) : 0;
+  const bool can_wide = kCanWide<FMT> && K % 128 == 0;
+  bool wide = can_wide && (forced == 0 ? true : forced >= 10000);
+  switch (forced % 10000) {
+#define BOLT_CFG_R16(MT_, KW_, UNR_)                                                                                \
+  case MT_ * 1000 + KW_ * 10 + UNR_:                                                                                \
+    if (wide) LaunchMmaGemvImpl_R16<FMT, kCanWide<FMT>, MT_, KW_, UNR_>(x, w, sc, gs, R, N, K, y, s);               \
+    else LaunchMmaGemvImpl_R16<FMT, false, MT_, KW_, UNR_>(x, w, sc, gs, R, N, K, y, s);                            \
+    return;
+    BOLT_CFG_R16(1, 4, 1) BOLT_CFG_R16(1, 8, 1) BOLT_CFG_R16(1, 16, 1) BOLT_CFG_R16(1, 8, 2) BOLT_CFG_R16(2, 4, 1) BOLT_CFG_R16(2, 8, 1) BOLT_CFG_R16(2, 4, 2)
+#undef BOLT_CFG_R16
+    default: break;
+  }
+  if (N >= 8192) {
+    if (wide) LaunchMmaGemvImpl_R16<FMT, kCanWide<FMT>, 2, 4>(x, w, sc, gs, R, N, K, y, s);
+    else LaunchMmaGemvImpl_R16<FMT, false, 2, 4>(x, w, sc, gs, R, N, K, y, s);
+  } else {
+    if (wide) LaunchMmaGemvImpl_R16<FMT, kCanWide<FMT>, 1, 16>(x, w, sc, gs, R, N, K, y, s);
+    else LaunchMmaGemvImpl_R16<FMT, false, 1, 16>(x, w, sc, gs, R, N, K, y, s);
+  }
+}
+
+// ------------------------------------------------------------------------------------------------------------------
 // MoeVerify: MoeDecode for R <= 8 rows with experts shared across rows. The (token, expert) pairs are grouped by expert; every
 // unique expert's int4 weights are read once and applied to all rows with the tensor-core GEMM above (the 8 columns of the
 // MMA are the rows, so rows that did not select the expert simply compute an unused column).
@@ -1109,6 +1304,41 @@ __global__ void MoeGroupKernel(const int* __restrict__ idx, int P, int topk, int
   if (p == 0) meta[0] = warp_tot[0] + warp_tot[1] + warp_tot[2] + warp_tot[3];
   __syncthreads();
   if (p < P) meta[1 + P + srank[q] * 8 + p / topk] = p;
+}
+
+// meta (int32) for 9 <= R <= 16 (P = R * topk <= 160):
+// [0] = #unique experts U', [1 .. P] = unique expert ids, [1+P + u*16 + row] = pair index (row * topk + k) or -1
+__global__ void MoeGroupKernel_R16(const int* __restrict__ idx, int P, int topk, int* __restrict__ meta) {
+  __shared__ int sidx[160], srank[160], warp_tot[5];
+  const int p = threadIdx.x, lane = p & 31, warp = p >> 5;
+  for (int i = p; i < P * 16; i += blockDim.x) meta[1 + P + i] = -1;
+  sidx[p] = (p < P) ? idx[p] : -1;
+  srank[p] = -1;
+  __syncthreads();
+  int q = -1;
+  if (p < P) {
+    const int my = sidx[p];
+    for (int j = 0; j <= p; ++j)
+      if (sidx[j] == my) { q = j; break; }
+  }
+  const bool first = (p < P) && (q == p);
+  const unsigned b = __ballot_sync(0xffffffffu, first);
+  if (lane == 0) warp_tot[warp] = __popc(b);
+  __syncthreads();
+  int off = 0;
+#pragma unroll
+  for (int w = 0; w < 5; ++w)
+    if (w < warp) off += warp_tot[w];
+  if (first) {
+    srank[p] = off + __popc(b & ((1u << lane) - 1u));
+    meta[1 + srank[p]] = sidx[p];
+  }
+  if (p == 0) meta[0] = warp_tot[0] + warp_tot[1] + warp_tot[2] + warp_tot[3] + warp_tot[4];
+  __syncthreads();
+  if (p < P) {
+    const int row = p / topk;
+    if (row < 16 && q >= 0 && srank[q] >= 0) meta[1 + P + srank[q] * 16 + row] = p;
+  }
 }
 
 // PH 1: h[pair, j] = relu2(bf16(sum_k z[row, k] * W1[e, j, k])); PH 2: part[pair, n] = bf16(sum_k h[pair, k] * W2[e, n, k]).
@@ -1166,6 +1396,120 @@ __global__ void __launch_bounds__(KW * 32)
   });
 }
 
+template <int FMT, int PH, bool WIDE, int MT, int KW>
+__global__ void __launch_bounds__(KW * 32)
+    MoeMmaKernel_R16(const bf16* __restrict__ xin, const int* __restrict__ meta, int P, int R, int Nrows, int K,
+                     const uint8_t* __restrict__ w, const bf16* __restrict__ sc, void* __restrict__ out) {
+  constexpr int NH = WIDE ? 2 : 1;
+  const int u = blockIdx.y;
+  if (u >= meta[0]) return;
+  const int64_t e = meta[1 + u];
+  const int* pair_of = meta + 1 + P + u * 16;
+  bool has_lo = false, has_hi = false;
+#pragma unroll
+  for (int r = 0; r < 8; ++r) {
+    has_lo = has_lo || (pair_of[r] >= 0);
+    has_hi = has_hi || (pair_of[8 + r] >= 0);
+  }
+  if (!has_lo && !has_hi) return;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int g = lane >> 2, t = lane & 3;
+  const int nchunks = K / (64 * NH);
+  const int n_base = blockIdx.x * (MT * 16);
+  constexpr float gs = FMT == kFmtFp4 ? 0x1p16f : 1.0f;
+
+  if (has_lo && has_hi) {
+    const int xpair0 = pair_of[g];
+    const int xpair1 = pair_of[8 + g];
+    const bf16* xr0 = xin;
+    const bf16* xr1 = xin;
+    bool xvalid0, xvalid1;
+    if constexpr (PH == 1) {
+      xvalid0 = g < R;
+      xvalid1 = (8 + g) < R;
+      xr0 += static_cast<int64_t>(min(g, R - 1)) * K;
+      xr1 += static_cast<int64_t>(min(8 + g, R - 1)) * K;
+    } else {
+      xvalid0 = xpair0 >= 0;
+      xvalid1 = xpair1 >= 0;
+      xr0 += static_cast<int64_t>(max(xpair0, 0)) * K;
+      xr1 += static_cast<int64_t>(max(xpair1, 0)) * K;
+    }
+    float acc[MT][2][4];
+#pragma unroll
+    for (int m = 0; m < MT; ++m)
+#pragma unroll
+      for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) acc[m][nt][i] = 0.f;
+    MmaMainLoop_R16<FMT, WIDE, MT, KW, 1>(warp, nchunks, acc, [&](int c, StageT_R16<FMT, WIDE, MT>& st) {
+#pragma unroll
+      for (int m = 0; m < MT; ++m)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const int64_t row = e * Nrows + min(n_base + m * 16 + g + 8 * h, Nrows - 1);
+          LoadWeightRow<FMT, WIDE>(w, sc, row, K, c, t, st.raw[m][h], st.sc[m][h]);
+        }
+      LoadX<NH>(xr0, xvalid0, c, t, st.x[0]);
+      LoadX<NH>(xr1, xvalid1, c, t, st.x[1]);
+    });
+    ReduceEpilogue_R16<MT, KW>(acc, warp, g, t, [&](int rl, int col, float v) {
+      const int j = n_base + rl;
+      if (j >= Nrows) return;
+      const int pair = pair_of[col];
+      if (pair < 0) return;
+      v = B2F(__float2bfloat16(v * gs));
+      if constexpr (PH == 1) {
+        const float r = fmaxf(v, 0.f);
+        reinterpret_cast<bf16*>(out)[static_cast<int64_t>(pair) * Nrows + j] = __float2bfloat16(r * r);
+      } else {
+        reinterpret_cast<float*>(out)[static_cast<int64_t>(pair) * Nrows + j] = v;
+      }
+    });
+  } else {
+    const int col_base = has_lo ? 0 : 8;
+    const int* half_pairs = pair_of + col_base;
+    const int xpair = half_pairs[g];
+    const bf16* xr = xin;
+    bool xvalid;
+    if constexpr (PH == 1) {
+      xvalid = (col_base + g) < R;
+      xr += static_cast<int64_t>(min(col_base + g, R - 1)) * K;
+    } else {
+      xvalid = xpair >= 0;
+      xr += static_cast<int64_t>(max(xpair, 0)) * K;
+    }
+    float acc[MT][4];
+#pragma unroll
+    for (int m = 0; m < MT; ++m)
+#pragma unroll
+      for (int i = 0; i < 4; ++i) acc[m][i] = 0.f;
+    MmaMainLoop<FMT, WIDE, MT, KW, 1>(warp, nchunks, acc, [&](int c, StageT<FMT, WIDE, MT>& st) {
+#pragma unroll
+      for (int m = 0; m < MT; ++m)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const int64_t row = e * Nrows + min(n_base + m * 16 + g + 8 * h, Nrows - 1);
+          LoadWeightRow<FMT, WIDE>(w, sc, row, K, c, t, st.raw[m][h], st.sc[m][h]);
+        }
+      LoadX<NH>(xr, xvalid, c, t, st.x);
+    });
+    ReduceEpilogue<MT, KW>(acc, warp, g, t, [&](int rl, int col, float v) {
+      const int j = n_base + rl;
+      if (j >= Nrows) return;
+      const int pair = half_pairs[col];
+      if (pair < 0) return;
+      v = B2F(__float2bfloat16(v * gs));
+      if constexpr (PH == 1) {
+        const float r = fmaxf(v, 0.f);
+        reinterpret_cast<bf16*>(out)[static_cast<int64_t>(pair) * Nrows + j] = __float2bfloat16(r * r);
+      } else {
+        reinterpret_cast<float*>(out)[static_cast<int64_t>(pair) * Nrows + j] = v;
+      }
+    });
+  }
+}
+
 // Optional integer attribute (custom-op attributes are not declared, so absence has to be probed).
 int OptAttr(const OrtKernelInfo* info, const char* name, int def) {
   try {
@@ -1190,17 +1534,24 @@ struct MoeVerifyState {
       auto z = c.GetInput(0);
       const int R = static_cast<int>(Dim(z, 0));
       const int P = R * topk;
-      if (R < 1 || R > 8 || P > 128) throw std::invalid_argument("MoeVerify: rows must be in [1,8] and rows*topk <= 128");
+      const bool is_r8 = (R >= 1 && R <= 8 && P <= 128);
+      const bool is_r16 = (R == 16 && P <= 160);
+      if (!is_r8 && !is_r16)
+        throw std::invalid_argument("MoeVerify: rows must be in [1,8] (P<=128) or 16 (P<=160)");
       if (Dim(z, 1) != 1024) throw std::invalid_argument("MoeVerify: latent size must be 1024");
       const int I = static_cast<int>(Dim(c.GetInput(3), 1));  // fc1_w [E, I, 512]
       if (I % 64 != 0) throw std::invalid_argument("MoeVerify: inter size must be a multiple of 64");
       auto out = c.GetOutput(0, std::vector<int64_t>{R, 1024});
       auto h = c.GetOutput(1, std::vector<int64_t>{P, I});
       auto part = c.GetOutput(2, std::vector<int64_t>{P, 1024});
-      auto meta = c.GetOutput(3, std::vector<int64_t>{1 + P + P * 8});
+      auto meta = c.GetOutput(3, std::vector<int64_t>{1 + P + P * (is_r16 ? 16 : 8)});
       cudaStream_t s = Stream(api, raw);
       int* mp = Out<int>(meta);
-      MoeGroupKernel<<<1, 128, 0, s>>>(In<int>(c, 1), P, topk, mp);
+      if (is_r16) {
+        MoeGroupKernel_R16<<<1, 160, 0, s>>>(In<int>(c, 1), P, topk, mp);
+      } else {
+        MoeGroupKernel<<<1, 128, 0, s>>>(In<int>(c, 1), P, topk, mp);
+      }
       static const int cfg = getenv("BOLT_MOE_CFG") ? atoi(getenv("BOLT_MOE_CFG")) : 0;  // 1: narrow chunks
       const bool wide2 = cfg == 0 && I % 128 == 0 && iq2 != 2;
       using C1 = std::integral_constant<int, 1>;
@@ -1212,13 +1563,26 @@ struct MoeVerifyState {
         constexpr int FMT = decltype(fmt)::value;
         auto fc1 = [&](auto mt, auto kw) {
           constexpr int MT = decltype(mt)::value, KW = decltype(kw)::value;
-          MoeMmaKernel<FMT, 1, kCanWide<FMT>, MT, KW><<<dim3(I / (16 * MT), P), KW * 32, KW * MT * 16 * 8 * sizeof(float), s>>>(
-              In<bf16>(c, 0), mp, P, R, I, 1024, In<uint8_t>(c, 3), In<bf16>(c, 4), Out<bf16>(h));
+          if (is_r16) {
+            MoeMmaKernel_R16<FMT, 1, kCanWide<FMT>, MT, KW><<<dim3(I / (16 * MT), P), KW * 32, KW * MT * 16 * 16 * sizeof(float), s>>>(
+                In<bf16>(c, 0), mp, P, R, I, 1024, In<uint8_t>(c, 3), In<bf16>(c, 4), Out<bf16>(h));
+          } else {
+            MoeMmaKernel<FMT, 1, kCanWide<FMT>, MT, KW><<<dim3(I / (16 * MT), P), KW * 32, KW * MT * 16 * 8 * sizeof(float), s>>>(
+                In<bf16>(c, 0), mp, P, R, I, 1024, In<uint8_t>(c, 3), In<bf16>(c, 4), Out<bf16>(h));
+          }
         };
         auto fc2 = [&](auto mt, auto kw) {
           constexpr int MT = decltype(mt)::value, KW = decltype(kw)::value;
           constexpr bool WD = kCanWide<FMT>;
-          if (WD && wide2) {
+          if (is_r16) {
+            if (WD && wide2) {
+              MoeMmaKernel_R16<FMT, 2, WD, MT, KW><<<dim3(1024 / (16 * MT), P), KW * 32, KW * MT * 16 * 16 * sizeof(float), s>>>(
+                  Out<bf16>(h), mp, P, R, 1024, I, In<uint8_t>(c, 5), In<bf16>(c, 6), Out<float>(part));
+            } else {
+              MoeMmaKernel_R16<FMT, 2, false, MT, KW><<<dim3(1024 / (16 * MT), P), KW * 32, KW * MT * 16 * 16 * sizeof(float), s>>>(
+                  Out<bf16>(h), mp, P, R, 1024, I, In<uint8_t>(c, 5), In<bf16>(c, 6), Out<float>(part));
+            }
+          } else if (WD && wide2) {
             MoeMmaKernel<FMT, 2, WD, MT, KW><<<dim3(1024 / (16 * MT), P), KW * 32, KW * MT * 16 * 8 * sizeof(float), s>>>(
                 Out<bf16>(h), mp, P, R, 1024, I, In<uint8_t>(c, 5), In<bf16>(c, 6), Out<float>(part));
           } else {
@@ -1282,6 +1646,11 @@ struct Nvfp4GemvState {
         CheckLaunch();
         return nullptr;
       }
+      if (R == 16 && K % 64 == 0) {
+        LaunchMmaGemv_R16<kFmtFp4>(xp, wp, sp, gp, R, N, K, yp, s);
+        CheckLaunch();
+        return nullptr;
+      }
       switch (R) {
         case 1: LaunchNvfp4<1>(xp, wp, sp, gp, N, K, yp, s); break;
         case 2: LaunchNvfp4<2>(xp, wp, sp, gp, N, K, yp, s); break;
@@ -1295,7 +1664,7 @@ struct Nvfp4GemvState {
         case 6: LaunchNvfp4<6>(xp, wp, sp, gp, N, K, yp, s); break;
         case 7: LaunchNvfp4<7>(xp, wp, sp, gp, N, K, yp, s); break;
         case 8: LaunchNvfp4<8>(xp, wp, sp, gp, N, K, yp, s); break;
-        default: throw std::invalid_argument("Nvfp4Gemv: rows must be in [1,8]");
+        default: throw std::invalid_argument("Nvfp4Gemv: rows must be in [1,8] or 16");
       }
       CheckLaunch();
       return nullptr;
@@ -1422,7 +1791,7 @@ void LaunchQGemv(int R, const bf16* x, const uint8_t* w, const bf16* sc, int N, 
     case 6: LaunchQGemvR<BITS, 6>(x, w, sc, N, K, y, s); break;
     case 7: LaunchQGemvR<BITS, 7>(x, w, sc, N, K, y, s); break;
     case 8: LaunchQGemvR<BITS, 8>(x, w, sc, N, K, y, s); break;
-    default: throw std::invalid_argument("QGemv: rows must be in [1,8]");
+    default: throw std::invalid_argument("QGemv: rows must be in [1,8] or 16");
   }
 }
 
@@ -1448,12 +1817,22 @@ struct QGemvState {
       }
       shape.back() = N;
       auto y = c.GetOutput(0, shape);
-      if (iq2 == 1 && !(R >= 2 && R <= 8 && K % 128 == 0)) throw std::invalid_argument("Q4Gemv iq2: needs 2..8 rows and K % 128 == 0");
+      if (iq2 == 1 && !((R >= 2 && R <= 8 && K % 128 == 0) || (R == 16 && K % 128 == 0)))
+        throw std::invalid_argument("Q4Gemv iq2: needs 2..8 or 16 rows and K % 128 == 0");
       if (iq2 == 2) {
         LaunchMmaGemv<kFmtIq2N>(In<bf16>(c, 0), In<uint8_t>(c, 1), In<bf16>(c, 2), nullptr, R, N, K, Out<bf16>(y), Stream(api, raw));
       } else if (iq2) {
-        LaunchMmaGemv<kFmtIq2>(In<bf16>(c, 0), In<uint8_t>(c, 1), In<bf16>(c, 2), nullptr, R, N, K, Out<bf16>(y), Stream(api, raw));
+        if (R == 16) {
+          LaunchMmaGemv_R16<kFmtIq2>(In<bf16>(c, 0), In<uint8_t>(c, 1), In<bf16>(c, 2), nullptr, R, N, K, Out<bf16>(y), Stream(api, raw));
+        } else {
+          LaunchMmaGemv<kFmtIq2>(In<bf16>(c, 0), In<uint8_t>(c, 1), In<bf16>(c, 2), nullptr, R, N, K, Out<bf16>(y), Stream(api, raw));
+        }
+      } else if (R == 16 && K % 64 == 0) {
+        LaunchMmaGemv_R16<BITS == 8 ? kFmtQ8 : kFmtQ4>(In<bf16>(c, 0), In<uint8_t>(c, 1), In<bf16>(c, 2), nullptr, R, N, K,
+                                                       Out<bf16>(y), Stream(api, raw));
       } else if (R >= 2 && R <= 8 && K % 64 == 0) {
+        if constexpr (BITS == 8) {
+        }
         LaunchMmaGemv<BITS == 8 ? kFmtQ8 : kFmtQ4>(In<bf16>(c, 0), In<uint8_t>(c, 1), In<bf16>(c, 2), nullptr, R, N, K,
                                                    Out<bf16>(y), Stream(api, raw));
       } else {
